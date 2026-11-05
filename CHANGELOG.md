@@ -93,7 +93,11 @@ working at the same time.
   meter (for example OpenAI `batches.create`), whether allowed by
   `on_unmetered` or acknowledged with `acknowledge_untracked`, raise
   `ApiKeyRefusedError` while the key is refused, including through a
-  reference taken before the refusal.
+  reference taken before the refusal. So do the calls the SDK hands straight
+  to the provider: `audio.speech.create` with an untracked TTS model, and
+  `converse`, `converse_stream`, `invoke_model`,
+  `invoke_model_with_response_stream` and `start_async_invoke` on clients that
+  are not Bedrock.
 - **Budget authority follows the project.** If validation pins a different
   project than the one earlier calls reached (for example after an outage and
   a rename), held leases and cached allows from before are dropped, and a

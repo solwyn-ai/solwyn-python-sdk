@@ -259,6 +259,11 @@ class ProjectBinding:
                     effect,
                     refusal.posture,
                 ):
+                    # Another response confirmed the stored refusal: it is
+                    # final now, and a provisional request's delayed body may
+                    # no longer replace it (it falls under the fence instead).
+                    if not provisional:
+                        self._provisional = None
                     return False
             self._refusal = StoredRefusal(
                 code=refusal.code,

@@ -13,7 +13,23 @@ from openai import AsyncOpenAI, OpenAI
 CONTROL_PLANE_URL = "https://control-plane.framework-smoke.test"
 OPENAI_BASE_URL = "https://openai.framework-smoke.test/v1"
 MODEL = "gpt-4.1-mini"
-SOLWYN_API_KEY = "sk_proj_" + "a" * 64
+SOLWYN_API_KEY = "solwyn_sk_" + "a" * 64
+SOLWYN_PROJECT = "framework-smoke"
+SOLWYN_PROJECT_ID = "proj_" + "a" * 24
+
+_AUTH_KEY_RESPONSE = {
+    "account_id": "00000000-0000-4000-8000-0000000000ac",
+    "key_id": "00000000-0000-4000-8000-00000000000e",
+    "key_prefix": SOLWYN_API_KEY[:26],
+    "key_name": SOLWYN_PROJECT,
+    "scope": "full",
+    "created_via": "dashboard",
+    "expires_at": "2099-01-01T00:00:00Z",
+    "rotation_grace_until": None,
+    "project_id": SOLWYN_PROJECT_ID,
+    "project_name": SOLWYN_PROJECT,
+    "budget_mode": "hard_deny",
+}
 
 _ALLOW_BUDGET_RESPONSE = {
     "allowed": True,
@@ -22,7 +38,7 @@ _ALLOW_BUDGET_RESPONSE = {
     "mode": "alert_only",
     "budget_limit": 100.0,
     "current_usage": 20.0,
-    "project_id": "proj_" + "a" * 24,
+    "project_id": SOLWYN_PROJECT_ID,
 }
 
 _DENY_BUDGET_RESPONSE = {
@@ -269,6 +285,10 @@ class FrameworkSmokeHarness:
             self.model_route = router.post(f"{OPENAI_BASE_URL}/chat/completions").mock(
                 side_effect=lambda _request: self._next_provider_response(response_iterator)
             )
+        # The SDK validates the key and pins the project before its first call.
+        router.get(f"{CONTROL_PLANE_URL}/api/v1/auth/key").mock(
+            return_value=httpx.Response(200, json=_AUTH_KEY_RESPONSE)
+        )
         router.post(f"{CONTROL_PLANE_URL}/api/v1/budgets/check").mock(
             side_effect=self._check_budget
         )

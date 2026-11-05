@@ -2461,6 +2461,7 @@ class Solwyn(_SolwynBase):
         self._enforce_explicit_surface("converse", source=SurfaceSource.WRAPPER)
         if self._solwyn_dialect == "bedrock":
             return self._intercepted_call(**_bedrock_internal_kwargs(kwargs))
+        self._enforce_key_refusal("converse")
         return self._solwyn_client.converse(**kwargs)
 
     def converse_stream(self, **kwargs: Any) -> Any:
@@ -2468,6 +2469,7 @@ class Solwyn(_SolwynBase):
         self._enforce_explicit_surface("converse_stream", source=SurfaceSource.WRAPPER)
         if self._solwyn_dialect == "bedrock":
             return self._intercepted_call(_force_stream=True, **_bedrock_internal_kwargs(kwargs))
+        self._enforce_key_refusal("converse_stream")
         return self._solwyn_client.converse_stream(**kwargs)
 
     def invoke_model(self, **kwargs: Any) -> Any:
@@ -2479,6 +2481,7 @@ class Solwyn(_SolwynBase):
         )
         if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        self._enforce_key_refusal("invoke_model")
         return self._solwyn_client.invoke_model(**kwargs)
 
     def invoke_model_with_response_stream(self, **kwargs: Any) -> Any:
@@ -2490,6 +2493,7 @@ class Solwyn(_SolwynBase):
         )
         if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        self._enforce_key_refusal("invoke_model_with_response_stream")
         return self._solwyn_client.invoke_model_with_response_stream(**kwargs)
 
     def start_async_invoke(self, **kwargs: Any) -> Any:
@@ -2501,6 +2505,7 @@ class Solwyn(_SolwynBase):
         )
         if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_START_ASYNC_INVOKE_GUIDANCE, field="start_async_invoke")
+        self._enforce_key_refusal("start_async_invoke")
         return self._solwyn_client.start_async_invoke(**kwargs)
 
     def _readmit_failover_hop(
@@ -4644,6 +4649,7 @@ class AsyncSolwyn(_SolwynBase):
         self._enforce_explicit_surface("converse", source=SurfaceSource.WRAPPER)
         if self._solwyn_dialect == "bedrock":
             return await self._intercepted_call(**_bedrock_internal_kwargs(kwargs))
+        self._enforce_key_refusal("converse")
         return await self._solwyn_client.converse(**kwargs)
 
     async def converse_stream(self, **kwargs: Any) -> Any:
@@ -4653,6 +4659,7 @@ class AsyncSolwyn(_SolwynBase):
             return await self._intercepted_call(
                 _force_stream=True, **_bedrock_internal_kwargs(kwargs)
             )
+        self._enforce_key_refusal("converse_stream")
         return await self._solwyn_client.converse_stream(**kwargs)
 
     async def invoke_model(self, **kwargs: Any) -> Any:
@@ -4664,6 +4671,7 @@ class AsyncSolwyn(_SolwynBase):
         )
         if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        self._enforce_key_refusal("invoke_model")
         return await self._solwyn_client.invoke_model(**kwargs)
 
     async def invoke_model_with_response_stream(self, **kwargs: Any) -> Any:
@@ -4675,6 +4683,7 @@ class AsyncSolwyn(_SolwynBase):
         )
         if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        self._enforce_key_refusal("invoke_model_with_response_stream")
         return await self._solwyn_client.invoke_model_with_response_stream(**kwargs)
 
     async def start_async_invoke(self, **kwargs: Any) -> Any:
@@ -4686,6 +4695,7 @@ class AsyncSolwyn(_SolwynBase):
         )
         if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_START_ASYNC_INVOKE_GUIDANCE, field="start_async_invoke")
+        self._enforce_key_refusal("start_async_invoke")
         return await self._solwyn_client.start_async_invoke(**kwargs)
 
     async def _readmit_failover_hop(

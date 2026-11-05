@@ -33,6 +33,7 @@ from . import (
     MODEL,
     OPENAI_BASE_URL,
     SOLWYN_API_KEY,
+    SOLWYN_PROJECT,
     FrameworkSmokeHarness,
     make_offline_openai_sync_client,
 )
@@ -41,6 +42,7 @@ from . import (
 def _client_options() -> dict[str, Any]:
     return {
         "api_key": SOLWYN_API_KEY,
+        "project": SOLWYN_PROJECT,
         "api_url": CONTROL_PLANE_URL,
         "provider": "openai",
         "budget_mode": "hard_deny",

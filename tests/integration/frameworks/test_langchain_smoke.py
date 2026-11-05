@@ -21,6 +21,7 @@ from . import (
     CONTROL_PLANE_URL,
     MODEL,
     SOLWYN_API_KEY,
+    SOLWYN_PROJECT,
     FrameworkSmokeHarness,
     make_offline_openai_client,
     make_offline_openai_sync_client,
@@ -74,6 +75,7 @@ class _AsyncMeteredChatCompletions:
 def _client_options() -> dict[str, Any]:
     return {
         "api_key": SOLWYN_API_KEY,
+        "project": SOLWYN_PROJECT,
         "api_url": CONTROL_PLANE_URL,
         "provider": "openai",
         "budget_mode": "hard_deny",

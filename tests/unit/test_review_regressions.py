@@ -17,6 +17,7 @@ Python implementation:
 from __future__ import annotations
 
 import contextlib
+import json
 from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
@@ -569,3 +570,132 @@ def test_6_project_binding_rejects_a_bad_selector(selector: str) -> None:
 @pytest.mark.unit
 def test_6_project_binding_trims_like_the_config() -> None:
     assert ProjectBinding(VALID_API_KEY, "  checkout-bot\t").selector == "checkout-bot"
+
+
+# ── 7. a provisional refusal's delayed body is fenced too ─────────────────
+
+
+def _status_error(response: httpx.Response) -> httpx.HTTPStatusError:
+    return httpx.HTTPStatusError("refused", request=response.request, response=response)
+
+
+def _expired_body(posture: str) -> bytes:
+    return json.dumps(
+        {"detail": {"code": "api_key_expired", "project_budget_mode": posture}}
+    ).encode()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "finalizing_body",
+    [
+        json.dumps({"detail": {"code": "api_key_invalid"}}).encode(),  # identical
+        _expired_body("hard_deny"),  # different, still blocking
+    ],
+    ids=["identical", "different"],
+)
+def test_7_a_delayed_refinement_never_weakens_a_refusal_finalized_meanwhile(
+    finalizing_body: bytes,
+) -> None:
+    binding = validated_binding()
+    request_a = httpx.Request("POST", f"{_URL}{_CHECK_PATH}")
+    _headers, dispatched_a = binding.request_headers()
+    status_a = httpx.Response(401, request=request_a)
+    binding.observe_status(status_a)  # A's status: provisional block
+    assert binding.refusal is not None and binding.refusal.effect == "block"
+
+    # Another response finalizes a blocking refusal before A's body arrives.
+    _headers, dispatched_b = binding.request_headers()
+    response_b = httpx.Response(
+        401, request=httpx.Request("POST", f"{_URL}{_CHECK_PATH}"), content=finalizing_body
+    )
+    assert binding.note_refusal(_status_error(response_b), dispatched_b)
+
+    # A's delayed body says alert_only: it must not relax B's final answer.
+    response_a = httpx.Response(401, request=request_a, content=_expired_body("alert_only"))
+    assert binding.note_refusal(_status_error(response_a), dispatched_a)
+
+    assert binding.refusal is not None
+    assert binding.refusal.effect == "block"
+
+
+@pytest.mark.unit
+def test_7_control_an_unchallenged_provisional_refusal_is_refined_by_its_own_body() -> None:
+    binding = validated_binding()
+    request = httpx.Request("POST", f"{_URL}{_CHECK_PATH}")
+    _headers, dispatched_at = binding.request_headers()
+    binding.observe_status(httpx.Response(401, request=request))
+    response = httpx.Response(401, request=request, content=_expired_body("alert_only"))
+
+    assert binding.note_refusal(_status_error(response), dispatched_at)
+
+    assert binding.refusal is not None
+    assert (binding.refusal.code, binding.refusal.effect) == ("api_key_expired", "allow_unmetered")
+
+
+# ── 8. special native paths re-check the stored refusal ───────────────────
+
+
+@pytest.mark.unit
+def test_8_decisions_create_rechecks_after_the_exit_check() -> None:
+    plane = FakeControlPlane(mode="alert_only")
+    provider = _Provider()
+    wrapped = plane.wrap(provider.client(), lease_enabled=False)
+    original = wrapped._apply_failover_tuning_directive
+
+    def admitted_then_refused(*args: Any, **kwargs: Any) -> Any:
+        _refuse_now([wrapped])()
+        return original(*args, **kwargs)
+
+    with (
+        wrapped,
+        patch_wrapper_local(wrapped, "_apply_failover_tuning_directive", admitted_then_refused),
+        pytest.raises(ApiKeyRefusedError),
+    ):
+        wrapped.decisions.create(model="gpt-5.5", input="hi")
+
+    assert provider.requests == 0
+
+
+@pytest.mark.unit
+def test_8_untracked_tts_passthrough_rechecks_the_stored_refusal() -> None:
+    plane = FakeControlPlane()
+    provider = _Provider()
+    wrapped = plane.wrap(provider.client(), on_unmetered="allow")
+    binding = wrapped._solwyn_binding
+    binding.refuse(Refusal(code="api_key_invalid", posture="hard_deny"), binding.generation)
+    with wrapped, pytest.raises(ApiKeyRefusedError):
+        wrapped.audio.speech.create(model="gpt-4o-mini-tts", voice="alloy", input="hi")
+
+    assert provider.requests == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "method",
+    [
+        "converse",
+        "converse_stream",
+        "invoke_model",
+        "invoke_model_with_response_stream",
+        "start_async_invoke",
+    ],
+)
+def test_8_non_bedrock_native_passthroughs_recheck_the_stored_refusal(method: str) -> None:
+    provider = _Provider()
+    raw = provider.client()
+    calls: list[str] = []
+
+    def native(**_kwargs: object) -> object:
+        calls.append(method)
+        return {}
+
+    object.__setattr__(raw, method, native)
+    plane = FakeControlPlane()
+    wrapped = plane.wrap(raw, on_unmetered="allow")
+    binding = wrapped._solwyn_binding
+    binding.refuse(Refusal(code="api_key_invalid", posture="hard_deny"), binding.generation)
+    with wrapped, pytest.raises(ApiKeyRefusedError):
+        getattr(wrapped, method)(modelId="m")
+
+    assert calls == []
