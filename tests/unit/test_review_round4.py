@@ -146,7 +146,7 @@ def _wrapped(provider: _Provider) -> Any:
 
 def _refuse(wrapped: Any) -> None:
     binding = wrapped._solwyn_binding
-    binding.refuse(Refusal("api_key_invalid", "hard_deny"), binding.generation)
+    binding.refuse(Refusal("api_key_invalid", "hard_deny"), binding.generation, from_validation=True)
 
 
 _BATCH = {"input_file_id": "f", "endpoint": "/v1/chat/completions", "completion_window": "24h"}
@@ -234,6 +234,9 @@ class _Owner:
     def _enforce_key_refusal(self, path: str) -> None:
         if self.refused:
             raise ApiKeyRefusedError("refused", code="api_key_invalid", field="api_key")
+
+    async def _enforce_key_refusal_async(self, path: str) -> None:
+        self._enforce_key_refusal(path)
 
 
 class AsyncSession:

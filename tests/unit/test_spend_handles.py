@@ -35,7 +35,7 @@ class _Wire:
 
 def _block(wrapped: Any) -> None:
     binding = wrapped._solwyn_binding
-    binding.refuse(Refusal(code="api_key_invalid", posture="hard_deny"), binding.generation)
+    binding.refuse(Refusal(code="api_key_invalid", posture="hard_deny"), binding.generation, from_validation=True)
 
 
 def _genai(wire: _Wire) -> Any:

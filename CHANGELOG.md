@@ -105,8 +105,16 @@ working at the same time.
   a new `responses.stream(...)` manager) checks again when it is awaited or
   entered, and so does a handle that sends later: clients derived with
   `with_options()` or `copy()`, a Google chat or live session, an OpenAI
-  realtime connection, OpenAI and Anthropic stream helpers, and pages that
-  fetch their next page (including a page obtained by awaiting).
+  realtime connection (also when opened with the manager's `enter()`), OpenAI
+  and Anthropic stream helpers, and pages that fetch their next page
+  (including a page obtained by awaiting, a page parsed from a
+  `with_raw_response` or `with_streaming_response` result, and every page
+  `iter_pages()` fetches). A derived client is still a context manager
+  (`with client.with_options(...) as derived:`). Unmetered methods run the
+  same key re-check as metered calls: right after a 401, 5 seconds after
+  Solwyn could not be reached, and 60 seconds after a refused re-check. So an
+  alert-only project whose only traffic is unmetered still relaxes to
+  unmetered running after a 401, instead of staying blocked.
 - **What a refusal stops.** A refusal stops every provider call admitted after
   it is recorded. A call that had already passed Solwyn's checks may still
   complete, even if the provider SDK's own async preparation or queueing sends

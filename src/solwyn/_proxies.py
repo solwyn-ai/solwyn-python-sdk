@@ -1257,7 +1257,7 @@ class _AsyncAudioSpeechProxy:
                 source=SurfaceSource.SYNTHETIC_POLICY,
                 condition=SurfaceCondition.OPENAI_UNTRACKED_TTS_MODEL,
             )
-            self._solwyn._enforce_key_refusal("audio.speech.create")
+            await self._solwyn._enforce_key_refusal_async("audio.speech.create")
             return await self._solwyn._solwyn_client.audio.speech.create(**kwargs)
         return await self._solwyn._media_call(self._spec, **{**kwargs, _AUDIO_OP_KEY: "speech"})
 

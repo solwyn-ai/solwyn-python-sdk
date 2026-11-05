@@ -282,7 +282,7 @@ class _Provider:
 def _refuse_now(holder: list[Any]) -> Callable[[], None]:
     def refuse() -> None:
         binding: ProjectBinding = holder[0]._solwyn_binding
-        binding.refuse(Refusal(code="api_key_invalid", posture="hard_deny"), binding.generation)
+        binding.refuse(Refusal(code="api_key_invalid", posture="hard_deny"), binding.generation, from_validation=True)
 
     return refuse
 
@@ -380,7 +380,7 @@ def test_3_unmetered_spend_honours_a_refusal_even_through_an_old_reference(
     wrapped = plane.wrap(provider.client(), **options)
     create = wrapped.batches.create  # taken before the refusal
     binding = wrapped._solwyn_binding
-    binding.refuse(Refusal(code="api_key_invalid", posture="hard_deny"), binding.generation)
+    binding.refuse(Refusal(code="api_key_invalid", posture="hard_deny"), binding.generation, from_validation=True)
     with wrapped:
         with pytest.raises(ApiKeyRefusedError):
             create(input_file_id="f", endpoint="/v1/chat/completions", completion_window="24h")
@@ -661,7 +661,7 @@ def test_8_untracked_tts_passthrough_rechecks_the_stored_refusal() -> None:
     provider = _Provider()
     wrapped = plane.wrap(provider.client(), on_unmetered="allow")
     binding = wrapped._solwyn_binding
-    binding.refuse(Refusal(code="api_key_invalid", posture="hard_deny"), binding.generation)
+    binding.refuse(Refusal(code="api_key_invalid", posture="hard_deny"), binding.generation, from_validation=True)
     with wrapped, pytest.raises(ApiKeyRefusedError):
         wrapped.audio.speech.create(model="gpt-4o-mini-tts", voice="alloy", input="hi")
 
@@ -692,7 +692,7 @@ def test_8_non_bedrock_native_passthroughs_recheck_the_stored_refusal(method: st
     plane = FakeControlPlane()
     wrapped = plane.wrap(raw, on_unmetered="allow")
     binding = wrapped._solwyn_binding
-    binding.refuse(Refusal(code="api_key_invalid", posture="hard_deny"), binding.generation)
+    binding.refuse(Refusal(code="api_key_invalid", posture="hard_deny"), binding.generation, from_validation=True)
     with wrapped, pytest.raises(ApiKeyRefusedError):
         getattr(wrapped, method)(modelId="m")
 
