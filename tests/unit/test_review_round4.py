@@ -445,3 +445,55 @@ def test_a_refusal_answer_still_backs_off_sixty_seconds() -> None:
         enforcer.close()
 
     assert [at - start for at in attempts] == [0, 60]
+
+
+# ── round 5: a second 401 status during an in-flight re-check ─────────────
+
+
+@pytest.mark.parametrize("stale", ["200", "alert_only_401", "hard_401", "outage"])
+def test_5_a_second_401_during_a_recheck_fences_it_and_queues_a_fresh_one(stale: str) -> None:
+    from solwyn.budget import BudgetEnforcer
+
+    clock = _Clock()
+    binding = validated_binding()
+    binding._clock = clock
+    first = httpx.Request("POST", f"{_URL}/api/v1/budgets/check")
+    binding.observe_status(httpx.Response(401, request=first))  # blocked, re-check due now
+    seen: list[str] = []
+    effects: list[str] = []
+    binding.add_listener(
+        lambda: effects.append(binding.refusal.effect if binding.refusal else "cleared")
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == AUTH_KEY_PATH
+        seen.append(stale if not seen else "fresh")
+        if len(seen) == 1:
+            # While this re-check is in flight, another request's 401 STATUS
+            # arrives (its body has not): the block must hold.
+            second = httpx.Request("POST", f"{_URL}/api/v1/metadata/ingest")
+            binding.observe_status(httpx.Response(401, request=second))
+            if stale == "200":
+                return httpx.Response(200, content=auth_key_body(), request=request)
+            if stale == "outage":
+                raise httpx.ConnectError("down", request=request)
+            body = _ALERT_401 if stale == "alert_only_401" else _HARD_401
+            return httpx.Response(401, content=body, request=request)
+        # The fresh re-check, dispatched after the second 401, decides.
+        return httpx.Response(401, content=_ALERT_401, request=request)
+
+    enforcer = BudgetEnforcer(
+        _URL, binding, lease_enabled=False, transport=httpx.MockTransport(handler)
+    )
+    try:
+        result = enforcer.check_budget(estimated_input_tokens=1, model="gpt-5.5", provider="openai")
+    finally:
+        enforcer.close()
+
+    # The stale answer never cleared or relaxed the block ...
+    assert "cleared" not in effects
+    assert "allow_unmetered" not in effects[:-1]
+    # ... and the queued fresh re-check ran right after it, in the same call.
+    assert seen == [stale, "fresh"]
+    assert binding.refusal is not None and binding.refusal.effect == "allow_unmetered"
+    assert result.allowed is True and result.reservation_id is None

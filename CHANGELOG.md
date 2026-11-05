@@ -128,7 +128,10 @@ working at the same time.
   unmetered; it is re-blocked only by a late 401 to a request it sent before
   the refusal, and that block lasts one key re-check. When a re-check
   succeeds, normal traffic resumes. A re-check that cannot reach Solwyn is
-  retried after 5 seconds (one at a time); one that is refused waits 60.
+  retried after 5 seconds (one at a time); one that is refused waits 60. A
+  401 that arrives while a re-check is in flight makes that re-check's answer
+  stale: it can neither lift nor loosen the block, and a fresh re-check runs
+  right after it.
 - Breaker reports start once the project id is pinned by validation; a budget
   check response no longer sets it.
 

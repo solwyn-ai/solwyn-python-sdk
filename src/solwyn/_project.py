@@ -356,7 +356,10 @@ class ProjectBinding:
     ) -> tuple[bool, bool, list[Callable[[], None]]]:
         """Apply one refusal under the lock: (changed, log it, listeners)."""
         now = self._clock()
-        if from_validation:
+        if from_validation and dispatched_at >= self._generation:
+            # A refused re-check backs off 60 s, unless something newer (a
+            # second 401, say) changed the binding while it was in flight:
+            # that change already queued the next re-check, which stands.
             self._next_validate_at = now + REFUSED_RETRY_S
         effect = self._effect_locked(refusal)
         stored = self._refusal
@@ -467,7 +470,7 @@ class ProjectBinding:
             try:
                 auth = AuthKeyResponse.model_validate_json(content)
             except ValidationError:
-                self.validation_unavailable()
+                self.validation_unavailable(dispatched_at)
                 return "unavailable", None
             if auth.scope != "full":
                 self.refuse(Refusal(code="read_only_key"), dispatched_at, from_validation=True)
@@ -475,7 +478,7 @@ class ProjectBinding:
             return self._validation_succeeded(auth, dispatched_at), auth
         refusal = classify(status, content)
         if refusal is None:
-            self.validation_unavailable()
+            self.validation_unavailable(dispatched_at)
             return "unavailable", None
         self.refuse(refusal, dispatched_at, from_validation=True)
         return "refused", None
@@ -501,9 +504,15 @@ class ProjectBinding:
             listener()
         return "valid"
 
-    def validation_unavailable(self) -> None:
-        """No answer: keep the state and schedule the next automatic attempt."""
+    def validation_unavailable(self, dispatched_at: int | None = None) -> None:
+        """No answer: keep the state and schedule the next automatic attempt.
+
+        A re-check dispatched before a newer change leaves the schedule that
+        change set (a queued immediate re-check stays queued).
+        """
         with self._lock:
+            if dispatched_at is not None and dispatched_at < self._generation:
+                return
             retry = UNVALIDATED_RETRY_S if self._state == "unvalidated" else REFUSED_OUTAGE_RETRY_S
             self._next_validate_at = self._clock() + retry
 

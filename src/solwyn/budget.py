@@ -199,6 +199,10 @@ _API_KEY_REFUSED = "api_key_refused"
 # a bound on refusal/recovery churn from other threads.
 _MAX_CHECK_ATTEMPTS = 3
 
+# Re-checks one gate entry may run: the due one, plus one fresh re-check when a
+# newer 401 made the first stale while it was in flight.
+_GATE_REVALIDATIONS = 2
+
 logger = logging.getLogger(__name__)
 
 
@@ -2865,9 +2869,15 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             attempt += 1
 
     def _gate(self) -> StoredRefusal | int:
-        """Entry gate: revalidate when due (never raises), then admit or refuse."""
+        """Entry gate: revalidate when due (never raises), then admit or refuse.
+
+        A second 401 arriving while a re-check was in flight makes that
+        re-check stale and queues a fresh one; it runs here, right after, once.
+        """
         self._drop_leases_after_binding_change()
-        if self._binding.revalidation_due():
+        for _ in range(_GATE_REVALIDATIONS):
+            if not self._binding.revalidation_due():
+                break
             self._revalidate()
             self._drop_leases_after_binding_change()
         return self._binding.admit()
@@ -2898,7 +2908,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             if saw_401(exc):  # recorded by the body guard; never an outage
                 return "refused", None
             logger.debug("project.validation_unavailable: %s", type(exc).__name__)
-            self._binding.validation_unavailable()
+            self._binding.validation_unavailable(dispatched_at)
             return "unavailable", None
         return self._binding.apply_auth_key(
             resp.status_code,
@@ -3883,9 +3893,15 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             attempt += 1
 
     async def _gate(self) -> StoredRefusal | int:
-        """Entry gate: revalidate when due (never raises), then admit or refuse."""
+        """Entry gate: revalidate when due (never raises), then admit or refuse.
+
+        See ``BudgetEnforcer._gate``: a re-check made stale by a newer 401 is
+        followed by one fresh re-check.
+        """
         self._drop_leases_after_binding_change()
-        if self._binding.revalidation_due():
+        for _ in range(_GATE_REVALIDATIONS):
+            if not self._binding.revalidation_due():
+                break
             await self._revalidate()
             self._drop_leases_after_binding_change()
         return self._binding.admit()
@@ -3924,7 +3940,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             if saw_401(exc):  # recorded by the body guard; never an outage
                 return "refused", None
             logger.debug("project.validation_unavailable: %s", type(exc).__name__)
-            self._binding.validation_unavailable()
+            self._binding.validation_unavailable(dispatched_at)
             return "unavailable", None
         return self._binding.apply_auth_key(
             resp.status_code,
