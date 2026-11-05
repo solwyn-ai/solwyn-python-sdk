@@ -113,6 +113,15 @@ no budget checks, leases or usage uploads (queued usage is dropped and counted
 as `api_key_refused`). A re-check that succeeds clears the refusal and normal
 traffic resumes.
 
+A refusal stops every provider call admitted after it is recorded, including
+calls made through objects the client handed out earlier: clients derived with
+`with_options()` or `copy()`, chat, live and realtime sessions, stream helpers,
+and pages that fetch their next page. A call that had already passed Solwyn's
+checks may still complete, even if the provider SDK's own async preparation or
+queueing sends it slightly later. If a re-check cannot reach Solwyn while a
+refusal is stored, the SDK tries again after 5 seconds; a re-check that is
+itself refused waits 60 seconds.
+
 Old project keys (`sk_proj_...`) no longer work; the SDK rejects them when
 the client is constructed. Create a key in the dashboard or with
 `solwyn keys create`. `SOLWYN_PROJECT_ID` is not read; use `SOLWYN_PROJECT`.

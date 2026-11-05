@@ -258,13 +258,15 @@ def test_weakening_needs_a_dispatch_after_the_stored_refusal() -> None:
 
 
 @pytest.mark.unit
-def test_an_identical_refusal_does_not_move_the_generation() -> None:
+def test_an_identical_independent_refusal_keeps_the_state_but_advances_the_ordering() -> None:
     binding, _clock = _binding()
     binding.refuse(Refusal(code="api_key_invalid"), 0)
-    generation = binding.generation
+    stored = binding.refusal
+    refusal_gen = binding.refusal_gen
 
-    assert binding.refuse(Refusal(code="api_key_invalid"), 0) is False
-    assert binding.generation == generation
+    assert binding.refuse(Refusal(code="api_key_invalid"), 0) is False  # no new state
+    assert binding.refusal == stored
+    assert binding.refusal_gen > refusal_gen  # nothing dispatched before may relax it
 
 
 @pytest.mark.unit

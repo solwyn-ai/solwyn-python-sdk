@@ -55,11 +55,19 @@ ExitVerdict = Literal["keep", "refused", "rerun"]
 
 # Retry cadence of the gate's automatic validation (spec section 6.2).
 UNVALIDATED_RETRY_S = 30.0
+# A re-check whose own answer was a refusal backs off 60 s ...
 REFUSED_RETRY_S = 60.0
+# ... but a re-check that could not reach Solwyn while refused retries after
+# 5 s (still single-flight), so a 401-triggered block on an alert-only project
+# does not outlast a short Solwyn outage by a minute.
+REFUSED_OUTAGE_RETRY_S = 5.0
 
 # Request extension the 401 status hook sets, so the caller can tell an unread
 # 401 (a refusal already recorded) from an outage.
 _STATUS_401_EXTENSION = "solwyn.status_401"
+# The ``refusal_gen`` this request's own 401 status recorded: only the same
+# request's body coalesces with it; every other answer advances the ordering.
+_REFUSAL_GEN_EXTENSION = "solwyn.refusal_gen"
 
 # Codes whose refusal may run calls unmetered once the client has validated:
 # a key that stopped working on a project that promises to block nothing.
@@ -149,6 +157,17 @@ class _ValidationBodyGuard(httpx.SyncByteStream, httpx.AsyncByteStream):
         aclose = getattr(self._inner, "aclose", None)
         if aclose is not None:
             await aclose()
+
+
+def _own_refusal_gen(exc: BaseException) -> int | None:
+    request = _request_of(exc)
+    if request is None:
+        return None
+    try:
+        value = request.extensions.get(_REFUSAL_GEN_EXTENSION)
+    except Exception:
+        return None
+    return value if isinstance(value, int) else None
 
 
 def saw_401(exc: BaseException) -> bool:
@@ -287,7 +306,12 @@ class ProjectBinding:
         return "block"
 
     def refuse(
-        self, refusal: Refusal, dispatched_at: int, *, from_validation: bool = False
+        self,
+        refusal: Refusal,
+        dispatched_at: int,
+        *,
+        from_validation: bool = False,
+        own_gen: int | None = None,
     ) -> bool:
         """Record a refusal; True when the stored refusal changed.
 
@@ -298,11 +322,21 @@ class ProjectBinding:
         ``/auth/key`` answer: it keeps the regular retry cadence, while a new
         401-class refusal from any other request schedules an immediate
         revalidation, so an alert-only project relaxes promptly.
+
+        Every independent refusal advances the ordering (``refusal_gen``),
+        even one identical to the stored refusal, so no answer dispatched
+        before it can relax or clear it. Only the body of the request whose own
+        401 status recorded the stored refusal (``own_gen``) coalesces with it.
         """
         message, field = refusal_message(refusal, self.selector)
         with self._lock:
             changed, log_first, listeners = self._record_locked(
-                refusal, message, field, dispatched_at, from_validation=from_validation
+                refusal,
+                message,
+                field,
+                dispatched_at,
+                from_validation=from_validation,
+                own_gen=own_gen,
             )
         if log_first:
             logger.error("solwyn.configuration_error.%s: %s", refusal.code, message)
@@ -318,6 +352,7 @@ class ProjectBinding:
         dispatched_at: int,
         *,
         from_validation: bool,
+        own_gen: int | None = None,
     ) -> tuple[bool, bool, list[Callable[[], None]]]:
         """Apply one refusal under the lock: (changed, log it, listeners)."""
         now = self._clock()
@@ -325,17 +360,32 @@ class ProjectBinding:
             self._next_validate_at = now + REFUSED_RETRY_S
         effect = self._effect_locked(refusal)
         stored = self._refusal
+        own = own_gen is not None and own_gen == self._refusal_gen
         if stored is not None:
             relaxes = stored.effect == "block" and effect == "allow_unmetered"
             if relaxes and dispatched_at < self._refusal_gen:
                 return False, False, []
-            if (stored.code, stored.message, stored.effect, stored.posture) == (
+            identical = (stored.code, stored.message, stored.effect, stored.posture) == (
                 refusal.code,
                 message,
                 effect,
                 refusal.posture,
-            ):
-                return False, False, []
+            )
+            if own and (identical or stored.effect == effect):
+                # This request's own status recorded the stored refusal: its
+                # body may only add details, never advance the ordering.
+                if not identical:
+                    self._refusal = StoredRefusal(
+                        code=refusal.code,
+                        message=message,
+                        field=field,
+                        effect=effect,
+                        posture=refusal.posture,
+                    )
+                return not identical, False, []
+            if identical:
+                # An independent confirmation: same state, newer ordering.
+                return False, False, self._advance_locked(refusal, from_validation, now)
         self._refusal = StoredRefusal(
             code=refusal.code,
             message=message,
@@ -344,15 +394,22 @@ class ProjectBinding:
             posture=refusal.posture,
         )
         self._state = "refused"
+        listeners = self._advance_locked(refusal, from_validation, now)
+        log_first = refusal.code not in self._logged_codes
+        if log_first:
+            self._logged_codes.add(refusal.code)
+        return True, log_first, listeners
+
+    def _advance_locked(
+        self, refusal: Refusal, from_validation: bool, now: float
+    ) -> list[Callable[[], None]]:
+        """Move the refusal ordering: nothing dispatched before may relax it."""
         self._generation += 1
         self._refusal_gen = self._generation
         if not from_validation:
             immediate = refusal.code in _RELAXABLE_CODES
             self._next_validate_at = now if immediate else now + REFUSED_RETRY_S
-        log_first = refusal.code not in self._logged_codes
-        if log_first:
-            self._logged_codes.add(refusal.code)
-        return True, log_first, list(self._listeners)
+        return list(self._listeners)
 
     def observe_status(self, response: httpx.Response) -> None:
         """Response hook: act on a 401 status before its body is read.
@@ -376,10 +433,15 @@ class ProjectBinding:
         with self._lock:
             stored = self._refusal
             if stored is not None and stored.effect == "block":
-                return  # already blocking, with possibly more precise details
-            _changed, log_first, listeners = self._record_locked(
-                refusal, message, field, self._generation, from_validation=False
-            )
+                # Already blocking, with possibly more precise details: keep
+                # them, but advance the ordering (an independent refusal).
+                log_first = False
+                listeners = self._advance_locked(refusal, False, self._clock())
+            else:
+                _changed, log_first, listeners = self._record_locked(
+                    refusal, message, field, self._generation, from_validation=False
+                )
+            request.extensions[_REFUSAL_GEN_EXTENSION] = self._refusal_gen
         if log_first:
             logger.error("solwyn.configuration_error.%s: %s", refusal.code, message)
         for listener in listeners:
@@ -393,7 +455,7 @@ class ProjectBinding:
         """
         refusal = classify_exception(exc)
         if refusal is not None:
-            self.refuse(refusal, dispatched_at)
+            self.refuse(refusal, dispatched_at, own_gen=_own_refusal_gen(exc))
             return True
         return saw_401(exc)
 
@@ -442,7 +504,7 @@ class ProjectBinding:
     def validation_unavailable(self) -> None:
         """No answer: keep the state and schedule the next automatic attempt."""
         with self._lock:
-            retry = UNVALIDATED_RETRY_S if self._state == "unvalidated" else REFUSED_RETRY_S
+            retry = UNVALIDATED_RETRY_S if self._state == "unvalidated" else REFUSED_OUTAGE_RETRY_S
             self._next_validate_at = self._clock() + retry
 
     # ── gate and exit check ────────────────────────────────────────────

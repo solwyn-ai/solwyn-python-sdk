@@ -103,9 +103,14 @@ working at the same time.
   are not Bedrock. A call that sends its request later (an async method's
   coroutine, an async page iterator, a `with_streaming_response` manager, or
   a new `responses.stream(...)` manager) checks again when it is awaited or
-  entered, and so does a handle that sends later: a Google chat session's
-  `send_message` and `send_message_stream`, and OpenAI and Anthropic stream
-  helpers.
+  entered, and so does a handle that sends later: clients derived with
+  `with_options()` or `copy()`, a Google chat or live session, an OpenAI
+  realtime connection, OpenAI and Anthropic stream helpers, and pages that
+  fetch their next page (including a page obtained by awaiting).
+- **What a refusal stops.** A refusal stops every provider call admitted after
+  it is recorded. A call that had already passed Solwyn's checks may still
+  complete, even if the provider SDK's own async preparation or queueing sends
+  it slightly later.
 - **A 401 is never forgotten.** The SDK records the refusal as soon as the
   401 status arrives; if its body then times out, is cancelled or is
   interrupted, the call is still blocked.
@@ -122,7 +127,8 @@ working at the same time.
   A client running unmetered on an alert-only project therefore stays
   unmetered; it is re-blocked only by a late 401 to a request it sent before
   the refusal, and that block lasts one key re-check. When a re-check
-  succeeds, normal traffic resumes.
+  succeeds, normal traffic resumes. A re-check that cannot reach Solwyn is
+  retried after 5 seconds (one at a time); one that is refused waits 60.
 - Breaker reports start once the project id is pinned by validation; a budget
   check response no longer sets it.
 

@@ -1814,25 +1814,66 @@ class _GuardedResource:
 
 
 # The provider SDKs' DEFERRED managers send their request on entry: OpenAI and
-# Anthropic ``ResponseContextManager`` / ``*StreamManager`` and OpenAI's
-# realtime ``*ConnectionManager``.
+# Anthropic ``ResponseContextManager`` / ``*StreamManager``, OpenAI realtime's
+# ``*ConnectionManager`` and Google Live's ``connect()`` context manager.
 _DEFERRED_MANAGER_SUFFIXES = ("Manager",)
 
-# Spend handles: objects an unmetered call returns whose METHODS send provider
-# requests later (a chat session). Those methods are fenced where they run.
-_SPEND_HANDLE_METHODS: dict[tuple[str, str], frozenset[str]] = {
-    ("google.genai.chats", "Chat"): frozenset({"send_message", "send_message_stream"}),
-    ("google.genai.chats", "AsyncChat"): frozenset({"send_message", "send_message_stream"}),
-}
+# Provider SDK packages whose objects may be spend handles.
+_PROVIDER_PACKAGES = (
+    "openai",
+    "anthropic",
+    "google.genai",
+    "google.generativeai",
+    "together",
+)
+
+# Spend handles: provider objects an unmetered call returns (or a fenced value
+# yields) whose methods send provider requests LATER: chat and live sessions,
+# realtime connections, and pages that fetch their next page.
+_SPEND_HANDLE_SUFFIXES = ("Page", "Pager", "Paginator", "Session", "Connection", "Chat")
+
+
+def _from_provider_sdk(value: object) -> bool:
+    # Public classes often report the bare package (``openai.OpenAI``).
+    module = type(value).__module__ or ""
+    return any(
+        module == package or module.startswith(f"{package}.") for package in _PROVIDER_PACKAGES
+    )
+
+
+def _is_provider_object(value: object) -> bool:
+    """A provider SDK object that is not plain response data (a pydantic model)."""
+    return _from_provider_sdk(value) and not isinstance(value, BaseModel)
+
+
+def _is_derived_client(value: object) -> bool:
+    """A provider client derived from the wrapped one (``with_options``, ``copy``)."""
+    value_type = type(value)
+    return (
+        _is_provider_object(value)
+        and callable(getattr(value_type, "with_options", None))
+        and callable(getattr(value_type, "copy", None))
+    )
+
+
+def _is_spend_handle(value: object) -> bool:
+    # Pages are pydantic models in some SDKs, so the suffix alone decides.
+    return _is_derived_client(value) or (
+        _from_provider_sdk(value)
+        and type(value).__name__.split("[", 1)[0].endswith(_SPEND_HANDLE_SUFFIXES)
+    )
 
 
 def _defer_key_refusal(result: Any, owner: _SolwynBase, path: str) -> Any:
-    """Re-check the key refusal where a deferred provider request really starts.
+    """Fence everything an unmetered provider call produces, recursively.
 
-    A coroutine (async SDK methods), an awaitable paginator, or a context
-    manager (``with_streaming_response``) sends nothing until it is awaited,
-    iterated or entered, so the refusal recorded in between must apply there.
-    Anything else already ran its request inside the call.
+    A coroutine, awaitable, deferred manager or generator sends nothing until
+    it is awaited, entered or iterated, so the refusal recorded in between
+    applies there; what it then produces (an awaited page, an entered live
+    session) is fenced in turn. A spend handle (a derived client, a session, a
+    connection, a page) is wrapped so each of its methods, and each nested
+    provider namespace, checks the refusal where it really sends. Anything
+    else already ran its request inside the call and is returned as is.
     """
     if inspect.iscoroutine(result):
         return _guarded_coroutine(result, owner, path)
@@ -1843,18 +1884,13 @@ def _defer_key_refusal(result: Any, owner: _SolwynBase, path: str) -> Any:
     if inspect.isawaitable(result):
         return _KeyRefusalGuardedAwaitable(result, owner, path)
     result_type = type(result)
-    handle_methods = _SPEND_HANDLE_METHODS.get((result_type.__module__, result_type.__name__))
-    if handle_methods is not None:
-        return _KeyRefusalGuardedHandle(result, owner, path, handle_methods)
-    # Only the SDKs' DEFERRED managers (OpenAI/Anthropic ``ResponseContextManager``
-    # and ``*StreamManager``): an already-sent ``Stream`` also supports ``with``,
-    # and wrapping it would change its type for no safety gain.
-    if not result_type.__name__.endswith(_DEFERRED_MANAGER_SUFFIXES):
-        return result
-    if hasattr(result_type, "__aenter__") and hasattr(result_type, "__aexit__"):
-        return _KeyRefusalGuardedAsyncContext(result, owner, path)
-    if hasattr(result_type, "__enter__") and hasattr(result_type, "__exit__"):
-        return _KeyRefusalGuardedContext(result, owner, path)
+    if result_type.__name__.split("[", 1)[0].endswith(_DEFERRED_MANAGER_SUFFIXES):
+        if hasattr(result_type, "__aenter__") and hasattr(result_type, "__aexit__"):
+            return _KeyRefusalGuardedAsyncContext(result, owner, path)
+        if hasattr(result_type, "__enter__") and hasattr(result_type, "__exit__"):
+            return _KeyRefusalGuardedContext(result, owner, path)
+    if _is_spend_handle(result):
+        return _KeyRefusalFencedObject(result, owner, path)
     return result
 
 
@@ -1864,10 +1900,16 @@ async def _guarded_coroutine(coroutine: Any, owner: _SolwynBase, path: str) -> A
     except BaseException:
         coroutine.close()  # never started: no "was never awaited" warning
         raise
-    return await coroutine
+    return _defer_key_refusal(await coroutine, owner, path)
+
+
+async def _guarded_await(awaitable: Any, owner: _SolwynBase, path: str) -> Any:
+    owner._enforce_key_refusal(path)
+    return _defer_key_refusal(await awaitable, owner, path)
 
 
 def _guarded_generator(generator: Any, owner: _SolwynBase, path: str) -> Any:
+    """The first ``next()`` sends the request; later items read its stream."""
     try:
         owner._enforce_key_refusal(path)
     except BaseException:
@@ -1886,32 +1928,25 @@ async def _guarded_async_generator(generator: Any, owner: _SolwynBase, path: str
         yield item
 
 
-class _KeyRefusalGuardedHandle:
-    """A spend handle (a chat session) whose sending methods honour key refusals.
+def _per_item_guarded_iter(iterator: Any, owner: _SolwynBase, path: str) -> Any:
+    """Page iteration may fetch the next page at any item: check before each."""
+    while True:
+        owner._enforce_key_refusal(path)
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        yield item
 
-    The handle itself is returned before any refusal; each of its sending
-    methods checks the stored refusal when called, and again where a deferred
-    result (a coroutine, a generator) actually sends.
-    """
 
-    __slots__ = ("__wrapped__", "_solwyn_methods", "_solwyn_owner", "_solwyn_path")
-
-    def __init__(self, inner: Any, owner: _SolwynBase, path: str, methods: frozenset[str]) -> None:
-        self.__wrapped__ = inner
-        self._solwyn_owner = owner
-        self._solwyn_path = path
-        self._solwyn_methods = methods
-
-    def __getattr__(self, name: str) -> Any:
-        value = getattr(self.__wrapped__, name)
-        if name in self._solwyn_methods and callable(value):
-            return _KeyRefusalGuardedCallable(
-                self._solwyn_owner, value, f"{self._solwyn_path}.{name}"
-            )
-        return value
-
-    def __repr__(self) -> str:
-        return repr(self.__wrapped__)
+async def _per_item_guarded_aiter(iterator: Any, owner: _SolwynBase, path: str) -> Any:
+    while True:
+        owner._enforce_key_refusal(path)
+        try:
+            item = await iterator.__anext__()
+        except StopAsyncIteration:
+            return
+        yield item
 
 
 class _KeyRefusalGuardedProxy:
@@ -1931,18 +1966,51 @@ class _KeyRefusalGuardedProxy:
         return repr(self.__wrapped__)
 
 
+class _KeyRefusalFencedObject(_KeyRefusalGuardedProxy):
+    """A spend handle whose methods, namespaces and pages honour key refusals.
+
+    Type-transparent: ``isinstance(handle, ProviderType)`` still holds. Private
+    attributes and plain data pass through unchanged.
+    """
+
+    __slots__ = ()
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # noqa: D105
+        return type(self.__wrapped__)
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self.__wrapped__, name)
+        if name.startswith("_"):
+            return value
+        path = f"{self._solwyn_path}.{name}"
+        if inspect.ismethod(value) or inspect.isfunction(value) or inspect.isbuiltin(value):
+            return _KeyRefusalGuardedCallable(self._solwyn_owner, value, path)
+        if _is_provider_object(value) and not inspect.isclass(value):
+            return _KeyRefusalFencedObject(value, self._solwyn_owner, path)
+        return value
+
+    def __iter__(self) -> Any:
+        return _per_item_guarded_iter(iter(self.__wrapped__), self._solwyn_owner, self._solwyn_path)
+
+    def __aiter__(self) -> Any:
+        return _per_item_guarded_aiter(
+            self.__wrapped__.__aiter__(), self._solwyn_owner, self._solwyn_path
+        )
+
+
 class _KeyRefusalGuardedAwaitable(_KeyRefusalGuardedProxy):
     """An awaitable (and possibly async-iterable) deferred request, e.g. a paginator."""
 
     __slots__ = ()
 
     def __await__(self) -> Any:
-        self._solwyn_owner._enforce_key_refusal(self._solwyn_path)
-        return self.__wrapped__.__await__()
+        return _guarded_await(self.__wrapped__, self._solwyn_owner, self._solwyn_path).__await__()
 
     def __aiter__(self) -> Any:
-        self._solwyn_owner._enforce_key_refusal(self._solwyn_path)
-        return self.__wrapped__.__aiter__()
+        return _per_item_guarded_aiter(
+            self.__wrapped__.__aiter__(), self._solwyn_owner, self._solwyn_path
+        )
 
 
 class _KeyRefusalGuardedContext(_KeyRefusalGuardedProxy):
@@ -1952,7 +2020,9 @@ class _KeyRefusalGuardedContext(_KeyRefusalGuardedProxy):
 
     def __enter__(self) -> Any:
         self._solwyn_owner._enforce_key_refusal(self._solwyn_path)
-        return self.__wrapped__.__enter__()
+        return _defer_key_refusal(
+            self.__wrapped__.__enter__(), self._solwyn_owner, self._solwyn_path
+        )
 
     def __exit__(self, *args: Any) -> Any:
         return self.__wrapped__.__exit__(*args)
@@ -1965,7 +2035,9 @@ class _KeyRefusalGuardedAsyncContext(_KeyRefusalGuardedProxy):
 
     async def __aenter__(self) -> Any:
         self._solwyn_owner._enforce_key_refusal(self._solwyn_path)
-        return await self.__wrapped__.__aenter__()
+        return _defer_key_refusal(
+            await self.__wrapped__.__aenter__(), self._solwyn_owner, self._solwyn_path
+        )
 
     async def __aexit__(self, *args: Any) -> Any:
         return await self.__wrapped__.__aexit__(*args)

@@ -803,8 +803,10 @@ def test_f16_a_delayed_alert_only_401_never_weakens_a_newer_hard_401() -> None:
     refusal = binding.refusal
     assert refusal is not None
     assert (refusal.posture, refusal.effect) == ("hard_deny", "block")
-    # B's revalidation answered hard too; the third call never left the gate.
-    assert seen == [_CHECK_PATH, _CHECK_PATH, AUTH_KEY_PATH]
+    # B's revalidation answered hard too. A's late 401 is an independent
+    # refusal: it advances the ordering and schedules one more immediate
+    # re-check (refused again); the third call sent no check.
+    assert seen == [_CHECK_PATH, _CHECK_PATH, AUTH_KEY_PATH, AUTH_KEY_PATH]
 
 
 @pytest.mark.unit
